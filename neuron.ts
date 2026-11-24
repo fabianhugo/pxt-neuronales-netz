@@ -1,10 +1,10 @@
 // ============================================================
 //  NEURON  --  flash this UNCHANGED onto every neuron board.
 //
-//  The board learns who it is from the sender: sender.ts holds a table of
-//  micro:bit serial number -> neuron name and radios each board its identity,
-//  its weights and its bias. Nothing in this file is per-board, so all five
-//  boards run the same hex.
+//  The board learns who it is over radio: the web page gives one board (the
+//  bridge, plugged in over USB) a table of serial number -> neuron name, and
+//  that board radios everyone their identity, weights and bias. Nothing in
+//  this file is per-board, so every board runs the same hex.
 //
 //  Values between neurons travel over RADIO -- there are no cables at all.
 //  Every board is on radio group 1 and hears every other board.
@@ -34,7 +34,7 @@
 //  neuron's "h0o" feeds the next layer, and an answer's "y0o" is collected by
 //  the sender. Nothing else is needed to move a value between two boards.
 //
-//  Radio protocol (see sender.ts):
+//  Radio protocol (sent by the SENDER ROLE further down):
 //      STRING "<serial>=<name>"  claims THIS board if the serial matches,
 //                                e.g. "-1394225184=h0". A STRING because
 //                                radio.sendValue()'s number is a 32-bit float
@@ -81,7 +81,7 @@
 //        the whole network    the whole network (the old sender's job)
 //
 //  Every board prints its own serial number to the USB log for the first few
-//  seconds after power-on, ready to paste into the web page's board table.
+//  seconds after power-on, ready to type into the web page's board table.
 // ============================================================
 
 // Without this the board sits on group 0 and never hears the sender.
@@ -96,22 +96,29 @@ radio.setGroup(1)
 serial.setRxBufferSize(254)
 serial.setTxBufferSize(254)
 
+// The most inputs one neuron can have. Boards are addressed by two-character
+// names (x0..x9, h0..h9, y0..y9), so no layer can be wider than 10, and a
+// neuron is fed by at most one whole layer.
+const MAX_FAN = 10
+
 // ---- identity, assigned over radio -------------------------------------
-let ownName = ""          // "h0".."h2", "y0", "y1" -- empty until the sender says
+let ownName = ""          // "x0", "h3", "y1", ... -- empty until the sender says
 let fanIn = 0             // how many inputs this neuron waits for
 let bias = 0
-let ownWeights: number[] = [0, 0, 0, 0]
-let weightsSeen: boolean[] = [false, false, false, false]
+let ownWeights: number[] = []
+let weightsSeen: boolean[] = []
 let biasSeen = false
 let fanInSeen = false
-function hslToHex(h: number, s: number, l: number) {
+// Hue (0-360), saturation and lightness (0-100) to a 0xRRGGBB colour for the
+// RGB LEDs. Used only by the rainbow a neuron shows while it calculates.
+function hslToHex(h: number, s: number, l: number): number {
     h = h % 360
     s = s / 100
     l = l / 100
-    c = (1 - Math.abs(2 * l - 1)) * s
-    x = c * (1 - Math.abs(h / 60 % 2 - 1))
-    m = l - c / 2
-    let r, g, b;
+    let c = (1 - Math.abs(2 * l - 1)) * s
+    let x = c * (1 - Math.abs(h / 60 % 2 - 1))
+    let m = l - c / 2
+    let r = 0, g = 0, b = 0
     if (h < 60) {
         r = c
         g = x
@@ -143,14 +150,7 @@ function hslToHex(h: number, s: number, l: number) {
     return (r << 16) | (g << 8) | b
 }
 
-let m = 0
-let x = 0
-let c = 0
-let l = 0
-let s = 0
-let h = 0
-
-function rainbow () {
+function rainbow() {
     for (let j = 0; j <= 330; j++) {
         basic.setLedColors(hslToHex(j % 360, 100, 30), hslToHex((j + 30) % 360, 100, 30), hslToHex((j + 60) % 360, 100, 30))
         basic.pause(4)
@@ -188,8 +188,8 @@ let winGreen = 0
 let winBlue = 0
 let outputThreshold = 0.5
 // Set by the radio handlers, repainted by the main loop. Drawing must NEVER
-// happen inside a handler: it blocks for hundreds of ms, and arriving radio
-// packets and softSerial lines are lost outright while it does.
+// happen inside a handler: it blocks for hundreds of ms, and radio packets
+// arriving meanwhile can be lost.
 let displayDirty = false
 let choiceCount = 0
 let choiceIndex = 0
@@ -197,22 +197,27 @@ let choiceIndex = 0
 // ---- per-round input state ---------------------------------------------
 // received[i] tracks whether inputs[i] has ARRIVED this round. A neuron can
 // legitimately send 0.0, so the value itself can never mean "nothing yet".
-let inputs: number[] = [0, 0, 0, 0]
-let received: boolean[] = [false, false, false, false]
+let inputs: number[] = []
+let received: boolean[] = []
 // Which neuron feeds each input slot, in weight order: sources[j] is the name
-// whose output is multiplied by ownWeights[j]. This is the radio replacement
-// for the cables -- with softSerial the PIN chose the slot, here the SENDER'S
-// NAME does. Empty until the sender pushes the wiring, and a slot that is
+// whose output is multiplied by ownWeights[j]: the SENDER'S NAME decides the
+// slot. Empty until the sender pushes the wiring, and a slot that is
 // still "" can never match an incoming name, so an unconfigured board quietly
 // ignores traffic instead of mixing values into the wrong weights.
-let sources: string[] = ["", "", "", ""]
-let sourcesSeen = 0
+let sources: string[] = []
+for (let j = 0; j < MAX_FAN; j++) {
+    ownWeights.push(0)
+    weightsSeen.push(false)
+    inputs.push(0)
+    received.push(false)
+    sources.push("")
+}
 
 // The slot a given neuron's output belongs in, or -1 when that neuron is not
-// one of ours. Only the first fanIn slots count: a stale entry left in slot 3
-// by an earlier, wider network must not capture a value.
+// one of ours. Only the first fanIn slots count: a stale entry left in a high
+// slot by an earlier, wider network must not capture a value.
 function slotOf(who: string): number {
-    for (let j = 0; j <= fanIn - 1 && j <= 3; j++) {
+    for (let j = 0; j <= fanIn - 1 && j < MAX_FAN; j++) {
         if (sources[j] == who) {
             return j
         }
@@ -319,12 +324,12 @@ function isInputBoard(): boolean {
     return ownName.charAt(0) == "x"
 }
 
-// CAUTION: basic.showString / showNumber SCROLL and block long enough to lose
-// an arriving softSerial line. Only showLeds / showIcon / clearScreen, which
-// are instant, may be used in the hot paths.
+// CAUTION: basic.showString / showNumber SCROLL and block for a second or more.
+// Only showLeds / showIcon / clearScreen, which are instant, may be used in the
+// hot paths.
 
 // Draw a 25-character "0"/"1" bitmap, row by row. led.plot/unplot are instant;
-// basic.showImage would block long enough to lose an arriving softSerial line.
+// basic.showImage would block.
 function drawBits(bits: string) {
     for (let y = 0; y <= 4; y++) {
         for (let x = 0; x <= 4; x++) {
@@ -337,12 +342,14 @@ function drawBits(bits: string) {
     }
 }
 
-// Put the screen back to whatever this board normally shows.
+// Put the screen back to whatever this board normally shows. A board with no
+// name yet shows its serial number instead -- that is done by the
+// serialOnDisplay fiber at the bottom, so here the screen is just cleared.
 function showState() {
     if (isInputBoard()) {
         showChoice()
     } else if (ownName == "") {
-        basic.showString("?")
+        basic.clearScreen()
     } else {
         basic.showString(ownName)
     }
@@ -354,12 +361,12 @@ function hasChoice(k: number): boolean {
 
 // Show the board's state on the 5x5 matrix.
 //
-// Pictures come from the sender over radio (see sender.ts inputPictures), so a
+// Pictures come from the sender over radio (see inputPictures below), so a
 // board stores no artwork of its own and the set can be changed without
 // reflashing. drawBits is instant; nothing here scrolls.
 function showChoice() {
     if (ownName == "") {
-        basic.showString("?")              // no identity yet
+        basic.clearScreen()                // no identity yet: serial is shown
         return
     }
     if (!hasChoice(choiceIndex)) {
@@ -387,7 +394,7 @@ function reportChoice() {
         serial.writeValue("sel_" + ownName, choiceValues[choiceIndex])
     } else {
         serial.writeLine("sel_" + ownName + ": MISSING (choice " + choiceIndex +
-            " never arrived -- press A on the sender again)")
+            " never arrived -- send the network again)")
     }
 }
 
@@ -423,8 +430,8 @@ function isConfigured(): boolean {
         // A weight with no source is a connection with no cable: values for
         // that slot would never arrive and the board would wait out the round
         // forever. Radio is unacknowledged, so a dropped "<name>s<j>" is a real
-        // possibility -- refusing to arm makes it visible as "?" on the display
-        // instead of a network that silently never answers.
+        // possibility -- refusing to arm makes the board visibly sit out the
+        // round instead of a network that silently never answers.
         if (sources[i] == "") {
             return false
         }
@@ -442,7 +449,7 @@ function hasAllInputs(): boolean {
 }
 
 function clearRound() {
-    for (let i = 0; i <= 3; i++) {
+    for (let i = 0; i < MAX_FAN; i++) {
         inputs[i] = 0
         received[i] = false
     }
@@ -453,9 +460,6 @@ function clearRound() {
 //  Radio: identity, parameters and the calculate request
 // ============================================================
 radio.onReceivedValue(function (name, value) {
-    // A board acting as sender also listens for the answer boards reporting in.
-    collectAnswer(name, value)
-
     // ---- another neuron's output: "<source>o" ----
     // This is the radio replacement for a value arriving on an input pin. It
     // is checked FIRST and returns immediately, so a neuron output can never
@@ -467,7 +471,7 @@ radio.onReceivedValue(function (name, value) {
             return
         }
         // Not one of our sources. Still a neuron output, so nothing else can
-        // want it -- except the sender's collectAnswer(), which already ran.
+        // want it.
         return
     }
 
@@ -504,7 +508,7 @@ radio.onReceivedValue(function (name, value) {
     }
 
     if (field == "i") {
-        fanIn = value
+        fanIn = Math.min(value, MAX_FAN)
         fanInSeen = true
         saveWanted = input.runningTime() + 2000
         return
@@ -574,7 +578,7 @@ radio.onReceivedValue(function (name, value) {
     }
     if (field.charAt(0) == "w") {
         let j = parseInt(field.substr(1, field.length - 1))
-        if (j >= 0 && j <= 3) {
+        if (j >= 0 && j < MAX_FAN) {
             ownWeights[j] = value
             weightsSeen[j] = true
             saveWanted = input.runningTime() + 2000
@@ -594,7 +598,7 @@ radio.onReceivedString(function (receivedString) {
     // ---- picture: "<name>p<k>:<5 packed chars>" ----
     // The 25 pixels arrive PACKED, one character per row (5 bits each, code
     // 95 + value), because radio.sendString only carries 19 characters and the
-    // unpacked form needed 30. See packPicture() in sender.ts.
+    // unpacked form needed 30. See packPicture().
     // Both the picture and the win message are "<head>:<payload>", so match on
     // the head rather than returning early -- an earlier version returned on
     // ANY colon message whose head was not a picture, which silently swallowed
@@ -662,9 +666,8 @@ radio.onReceivedString(function (receivedString) {
     // without resending the whole network.
     if (mine && head.charAt(2) == "s") {
         let j = parseInt(head.substr(3, head.length - 3))
-        if (j >= 0 && j <= 3) {
+        if (j >= 0 && j < MAX_FAN) {
             sources[j] = payload
-            sourcesSeen = sourcesSeen | (1 << j)
             saveWanted = input.runningTime() + 2000
             serial.writeLine("src " + ownName + " slot " + j + " <- " + payload)
         }
@@ -720,10 +723,6 @@ radio.onReceivedString(function (receivedString) {
 //  above, which calls acceptInput(). That handler must stay the ONLY one --
 //  registering onReceivedValue twice replaces the first.
 //
-//  What used to be three pin handlers is now one name lookup. The old
-//  basic.pause(10) those handlers needed is gone with them: it existed to let
-//  the bit-banged softSerial driver settle, and the radio driver has its own
-//  buffer.
 // ============================================================
 // Store an incoming neuron output in whichever slot that neuron feeds.
 // Returns true when the value was ours, so the caller can stop looking.
@@ -767,12 +766,15 @@ const SAVE_KEY = "nn"
 // has to be stored like any other parameter. A version-2 save has none, and a
 // board restored from one would have weights it could never match a value to,
 // so such a save is refused outright and the board waits for a fresh push.
-const SAVE_VERSION = 3
+// 4: up to MAX_FAN (10) weights per neuron instead of 4, so every field after
+// the weights moved.
+const SAVE_VERSION = 4
 
 // One flat array: name-as-digits are impossible, so the name is stored
 // separately as a string and everything numeric goes in one array.
-//   [fanIn, bias, w0..w3, myMean, myStd, outputThreshold,
-//    winRed, winGreen, winBlue, choiceCount, choiceValues...]
+//   [SAVE_VERSION, fanIn, bias, w0..w(MAX_FAN-1), myMean, myStd,
+//    outputThreshold, winRed, winGreen, winBlue, choiceCount, actKind,
+//    choiceValues...]
 function saveToFlash() {
     if (ownName == "") {
         return
@@ -786,7 +788,7 @@ function saveToFlash() {
     // cannot go in the numeric array; one key rather than one per slot, because
     // the slots are only meaningful together.
     let srcLine = ""
-    for (let j = 0; j <= 3; j++) {
+    for (let j = 0; j < MAX_FAN; j++) {
         srcLine = srcLine + (j > 0 ? "," : "") + sources[j]
     }
     settings.writeString(SAVE_KEY + "s", srcLine)
@@ -794,7 +796,7 @@ function saveToFlash() {
     // from a newer one and its choice values get read as the wrong fields --
     // the first choice was being loaded as the activation.
     let nums = [SAVE_VERSION, fanIn, bias]
-    for (let i = 0; i <= 3; i++) {
+    for (let i = 0; i < MAX_FAN; i++) {
         nums.push(ownWeights[i])
     }
     nums.push(myMean)
@@ -824,7 +826,8 @@ function loadFromFlash() {
         return false
     }
     let nums = settings.readNumberArray(SAVE_KEY + "v")
-    if (nums == null || nums.length < 14) {
+    // Everything up to and including actKind; choice values may follow.
+    if (nums == null || nums.length < 3 + MAX_FAN + 8) {
         return false
     }
     // Refuse anything this version does not understand, rather than reading a
@@ -839,8 +842,9 @@ function loadFromFlash() {
     // which isConfigured() reads as "not wired yet" -- the same state as a
     // board that has never been pushed to, and the safe one.
     let srcLine = settings.readString(SAVE_KEY + "s")
-    sources = ["", "", "", ""]
-    sourcesSeen = 0
+    for (let j = 0; j < MAX_FAN; j++) {
+        sources[j] = ""
+    }
     if (srcLine != null) {
         let cur = ""
         let slot = 0
@@ -849,11 +853,8 @@ function loadFromFlash() {
             // repeating the push below.
             let ch = i < srcLine.length ? srcLine.charAt(i) : ","
             if (ch == ",") {
-                if (slot <= 3) {
+                if (slot < MAX_FAN) {
                     sources[slot] = cur
-                    if (cur != "") {
-                        sourcesSeen = sourcesSeen | (1 << slot)
-                    }
                 }
                 slot = slot + 1
                 cur = ""
@@ -866,23 +867,25 @@ function loadFromFlash() {
     fanInSeen = fanIn > 0
     bias = nums[2]
     biasSeen = true
-    for (let i = 0; i <= 3; i++) {
+    for (let i = 0; i < MAX_FAN; i++) {
         ownWeights[i] = nums[3 + i]
         weightsSeen[i] = i < fanIn
     }
-    myMean = nums[7]
-    myStd = nums[8]
-    outputThreshold = nums[9]
-    winRed = nums[10]
-    winGreen = nums[11]
-    winBlue = nums[12]
-    choiceCount = nums[13]
-    actKind = nums[14]
+    let at = 3 + MAX_FAN
+    myMean = nums[at]
+    myStd = nums[at + 1]
+    outputThreshold = nums[at + 2]
+    winRed = nums[at + 3]
+    winGreen = nums[at + 4]
+    winBlue = nums[at + 5]
+    choiceCount = nums[at + 6]
+    actKind = nums[at + 7]
+    at = at + 8
     choiceValues = []
     choiceValuesSeen = []
     for (let k = 0; k <= choiceCount - 1; k++) {
-        if (15 + k <= nums.length - 1) {
-            choiceValues.push(nums[15 + k])
+        if (at + k <= nums.length - 1) {
+            choiceValues.push(nums[at + k])
             choiceValuesSeen.push(true)
         }
     }
@@ -904,11 +907,9 @@ function loadFromFlash() {
 // ============================================================
 basic.forever(function () {
     basic.pause(20)
-    // Repaint here rather than in the radio handlers that set displayDirty.
-    // basic.showString scrolls for over a second, and a board stuck in it MISSES
-    // an arriving softSerial line outright -- bit-banged serial has no buffer.
-    // Doing it here keeps handlers instant, and a repaint only ever happens on a
-    // state change, never mid-round.
+    // Repaint here rather than in the radio handlers that set displayDirty:
+    // basic.showString scrolls for over a second, and doing it here keeps the
+    // handlers instant. A repaint only ever happens on a state change.
     if (displayDirty) {
         displayDirty = false
         showState()
@@ -1023,42 +1024,25 @@ basic.forever(function () {
 //  push the same data, so it is harmless, but only one is ever needed.
 // ============================================================
 // ============================================================
-//  1. WHICH BOARD IS WHICH NEURON
-//
-//  Read each board's serial number off the USB serial log (neuron.ts prints
-//  it on button B) and paste it in here. The name decides what the board
-//  does; the order of this list does not matter.
+//  All tables below start EMPTY. The web page fills them over USB (ARCH,
+//  SERIAL, NEURON, ...) and then sends SEND. They live in RAM only: after a
+//  power cut the bridge board has to be sent the network again before A+B
+//  can push it.
+// ============================================================
+// ============================================================
+//  1. WHICH BOARD IS WHICH NEURON  (SERIAL command)
 //
 //  Kept as STRINGS on purpose: radio.sendValue() carries a 32-bit FLOAT, exact
-//  only for integers up to 2^24 (16777216). Every serial below is far larger,
-//  so sending one as a number rounds it (139422584 -> 139422592) and it could
-//  never match. Identity therefore travels as text via radio.sendString().
+//  only for integers up to 2^24 (16777216). A board serial is far larger, so
+//  sending one as a number rounds it and it could never match. Identity
+//  therefore travels as text via radio.sendString(). The serial is a SIGNED
+//  32-bit int and can be negative -- the minus sign is part of it.
+//
+//  The two arrays line up by position: serialOf("h1") is the serial whose
+//  allNames[i] is "h1".
 // ============================================================
-//  NOTE: the serial is a SIGNED 32-bit int and can be NEGATIVE -- h0 reports
-//  -1394225184. Keep the minus sign and every digit exactly as the board prints
-//  it. Press B on a board and it prints a ready-to-paste quoted line.
-// ONE table for every board -- inputs, hidden neurons and answers alike. The
-// two entries line up by position: serialOf("h1") is the serial whose
-// allNames[i] is "h1". Looking a serial up BY NAME means nothing depends on a
-// second table staying in the same order as this one.
-let allNames: string[] = [
-    "x0",
-    "x1",
-    "h0",
-    "h1",
-    "h2",
-    "y0",
-    "y1"
-]
-let allSerials: string[] = [
-    "-2022602061",   // -> x0
-    "984150378",     // -> x1
-    "-1394225184",   // -> h0   confirmed from the board's own dump
-    "-1280350870",   // -> h1   <-- UNCONFIRMED, re-read with button B
-    "850974008",     // -> h2   <-- UNCONFIRMED, re-read with button B
-    "1240653277",    // -> y0   <-- UNCONFIRMED, re-read with button B
-    "1843421070"     // -> y1   <-- UNCONFIRMED, re-read with button B
-]
+let allNames: string[] = []
+let allSerials: string[] = []
 
 // The serial for a board name, or "0" when the page has not set one yet.
 function serialOf(name: string): string {
@@ -1084,90 +1068,47 @@ function setSerial(name: string, sn: string) {
 
 // The neuron boards, in the order their weights arrive: hidden layers first,
 // then the answers. Rebuilt by the ARCH command.
-let boardNames: string[] = [
-    "h0",
-    "h1",
-    "h2",
-    "y0",
-    "y1"
-]
+let boardNames: string[] = []
 
 // ============================================================
-//  2. THE NETWORK  --  2-3-2, sigmoid, trained with input scaling OFF
+//  2. THE NETWORK  (NEURON command)
 //
-//  Straight from the training page's CSV export. One entry per neuron, in
-//  order h0, h1, h2, y0, y1; each is [bias, w0, w1, ...] where wJ is the
-//  weight on the J-th incoming connection.
-//
-//  Wire it so those J's line up with the pins:
-//      h0/h1/h2 :  P0 = x0,  P1 = x1          (from the two x boards)
-//      y0/y1    :  P0 = h0,  P1 = h1,  P2 = h2
+//  One entry per neuron, in boardNames order: its bias, and its weights where
+//  netWeights[k][j] is the weight on the j-th incoming connection.
 // ============================================================
-let netBias: number[] = [
-    8.468311946492,           // h0
-    10.151287262326619,       // h1
-    -9.865710916162397,       // h2
-    -4.758934173183672,       // y0
-    4.758934173183669         // y1
-]
-let netWeights: number[][] = [
-    [-15.777259975468265, 1.6240190707936146],                      // h0 <- x0, x1
-    [-11.387501878042364, -0.12801763005923056],                    // h1 <- x0, x1
-    [-1.7296569850093202, 11.775940812933898],                      // h2 <- x0, x1
-    [-9.282315308018319, 9.533732130267774, 9.517074238087051],     // y0 <- h0, h1, h2
-    [10.367666462491574, -8.88285326050701, -9.6635054619619]       // y1 <- h0, h1, h2
-]
+let netBias: number[] = []
+let netWeights: number[][] = []
 
 // ============================================================
 //  2d. THE WIRING  --  which neuron feeds which input slot
 //
-//  This is the table that replaced the cables. One row per neuron, in the same
-//  order as netWeights, naming the neurons whose outputs its weights multiply:
-//  netSources[k][j] is the source of weight j. The comments on netWeights above
-//  already stated this ("y0 <- h0, h1, h2"); with radio it has to be machine
-//  readable, because the boards can no longer learn it from how they are wired.
-//
-//  It MUST line up with netWeights. Swap two names here and the network
-//  computes with the weights crossed over -- exactly the failure that swapping
-//  two cables used to cause, and just as silent.
+//  One row per neuron, in the same order as netWeights: netSources[k][j] names
+//  the neuron whose output weight j multiplies. It MUST line up with
+//  netWeights -- swap two names and the network computes with the weights
+//  crossed over, silently.
 //
 //  Rebuilt automatically by the ARCH command, so the web page never has to
 //  send it: a fully connected network's wiring follows from the layer sizes.
 // ============================================================
-let netSources: string[][] = [
-    ["x0", "x1"],              // h0
-    ["x0", "x1"],              // h1
-    ["x0", "x1"],              // h2
-    ["h0", "h1", "h2"],        // y0
-    ["h0", "h1", "h2"]         // y1
-]
+let netSources: string[][] = []
 
 // ============================================================
 //  2a. THE OUTPUT LAYER  --  what each y board announces when it wins
 //
 //  When an output neuron's value exceeds pushThreshold it flashes its colour
-//  and scrolls its message, the way nn.ts did ("frech" / "nicht frech").
-//  Edit the text here and it is pushed over radio -- no reflashing.
+//  and shows its picture, or scrolls its message when it has none.
 // ============================================================
-let outputNames: string[] = ["y0", "y1"]
+let outputNames: string[] = []      // rebuilt by ARCH
 
 // One picture per output neuron, in the same order: a 25-character "0"/"1"
-// string, or "" for "no picture, scroll the message instead". Empty by default
-// so a board that is sent no artwork behaves exactly as it always did.
-let outputPictures: string[] = ["", ""]
+// string, or "" for "no picture, scroll the message instead".  (YPIC)
+let outputPictures: string[] = []
 
-// One message per output neuron, in the same order. Used when that neuron has
-// no picture.
-let outputMessages: string[] = [
-    "nicht frech",     // y0 wins
-    "frech"            // y1 wins
-]
+// One message per output neuron, in the same order.  (MSG)
+let outputMessages: string[] = []
 
-// Flash colour per output neuron, as [red, green, blue], 0-255.
-let outputColors: number[][] = [
-    [0, 40, 0],        // y0: green
-    [40, 0, 0]         // y1: red
-]
+// Flash colour per output neuron, as [red, green, blue], 0-255.  (COL)
+let outputColors: number[][] = []
 
 // The threshold pushed to the answer boards. Named apart from this board's own
 // outputThreshold, which is what IT was told to use.
@@ -1198,37 +1139,16 @@ let normStd: number[] = []
 //  On the board, A and B step through the list and the picture is displayed;
 //  the selected value is sent into the network when a round starts.
 //
-//  Pictures are 5 rows of 5 characters, "1" = lit, "0" = dark. Edit them here
-//  and they are pushed to the boards -- the boards store no pictures of their
-//  own. Keep each row exactly 5 characters long.
+//  Pictures are 25 characters, row by row, "1" = lit, "0" = dark; "" means
+//  "no picture", and the board then shows the choice number as dots.
 // ============================================================
-let inputNames: string[] = ["x0", "x1"]
+let inputNames: string[] = []       // rebuilt by ARCH
 
-// One row per x board: the values that board can send.
-let inputChoices: number[][] = [
-    [0.25, 0.50, 0.75, 1.00],        // x0
-    [0.2, 0.4, 0.6, 0.8, 1.0]        // x1
-]
+// One row per x board: the values that board can send.  (CHOICES)
+let inputChoices: number[][] = []
 
-// One picture per choice, in the same order as inputChoices. 5 rows of 5
-// characters, "1" = lit. Copied verbatim from the working input.ts, so the
-// boards show exactly the artwork they did before -- but sent over radio, so
-// changing a picture here needs no reflashing of the neuron boards.
-let inputPictures: string[][] = [
-    [
-        "11011" + "11011" + "00000" + "00000" + "00000",   // x0 = 0.25
-        "00011" + "11011" + "00000" + "00000" + "00000",   // x0 = 0.50
-        "10010" + "01001" + "00000" + "00000" + "00000",   // x0 = 0.75
-        "00000" + "11011" + "00000" + "00000" + "00000"    // x0 = 1.00
-    ],
-    [
-        "00000" + "00000" + "01110" + "10001" + "11111",   // x1 = 0.2
-        "00000" + "00000" + "00000" + "10001" + "01110",   // x1 = 0.4
-        "00000" + "00000" + "11110" + "10010" + "01101",   // x1 = 0.6
-        "00000" + "00000" + "11111" + "11111" + "01110",   // x1 = 0.8
-        "00000" + "00000" + "11111" + "10001" + "01110"    // x1 = 1.0
-    ]
-]
+// One picture per choice, in the same order as inputChoices.  (PIC)
+let inputPictures: string[][] = []
 
 // ============================================================
 //  3. Pushing the parameters out
@@ -1237,7 +1157,7 @@ let inputPictures: string[][] = [
 // identity first -- a neuron ignores weights until it knows its own name.
 // Tell a board who it is. Repeated because radio is unacknowledged and this is
 // the one message a board cannot do without: miss it and the board ignores
-// everything else that follows, staying on "?" for the whole round.
+// everything else that follows, and keeps showing its serial number.
 function sendIdentity(name: string) {
     let sn = serialOf(name)
     let msg = sn + "=" + name
@@ -1297,48 +1217,6 @@ function sendNeuron(index: number) {
 // Why base 95: codes 95..126 ("_" through "~") are 32 consecutive printable
 // characters containing no ":" (the field separator), no quote and no
 // backslash, so nothing needs escaping and nothing confuses the parser.
-// Pack a MakeCode Image directly, so pictures can be authored in the editor's
-// visual grid instead of as "0"/"1" text:
-//
-//     sendPicture("x0", 0, images.createImage(`
-//         . . . . .
-//         . # . . #
-//         . # . . #
-//         . . # # #
-//         . . . . .
-//         `))
-//
-// Same wire format as packPicture -- 5 bits per character, one per row.
-function packImage(img: Image): string {
-    let out = ""
-    for (let y = 0; y <= 4; y++) {
-        let v = 0
-        for (let x = 0; x <= 4; x++) {
-            if (img.pixel(x, y)) {
-                v = v | (1 << x)
-            }
-        }
-        out = out + String.fromCharCode(95 + v)
-    }
-    return out
-}
-
-// Send one MakeCode Image as choice k's picture for board `name` ("x0"/"x1").
-// Fits a single radio message (10 characters).
-//
-// NOT called from sendAll -- it is here to be called by hand when you want to
-// push one picture drawn in the MakeCode editor, e.g.
-//     sendPicture("x0", 0, images.createImage(`
-//         . # . # .
-//         . . . . .
-//         # . . . #
-//         . # # # .
-//         . . . . .
-//         `))
-function sendPicture(name: string, k: number, img: Image) {
-    radio.sendString(name + "p" + k + ":" + packImage(img))
-}
-
 function packPicture(bits: string): string {
     let out = ""
     for (let y = 0; y <= 4; y++) {
@@ -1399,7 +1277,7 @@ function sendOutput(index: number) {
 function sendInput(index: number) {
     let name = inputNames[index]
     let values = inputChoices[index]
-    let pics = inputPictures[index]
+    let pics = index <= inputPictures.length - 1 ? inputPictures[index] : []
 
     sendIdentity(name)
     radio.sendValue(name + "n", values.length)        // how many choices
@@ -1435,27 +1313,24 @@ function sendInput(index: number) {
     // Pictures last, once the board is already usable. One message each: the
     // 25 bits are PACKED, five per character, so the whole picture fits in the
     // 19-character limit radio.sendString imposes (see packPicture).
+    // A choice with no picture ("") is skipped: "n" above already cleared the
+    // board's old pictures, so it falls back to showing dots.
     for (let k = 0; k <= pics.length - 1; k++) {
+        if (pics[k].length != 25) {
+            continue
+        }
         radio.sendString(name + "p" + k + ":" + packPicture(pics[k]))
         basic.pause(150)
     }
     serial.writeLine("sent " + name + " (" + values.length + " choices)")
 }
 
-// Catch a mis-edited table before it goes on the air: a missing picture or a
-// wrong-length row would otherwise just silently fail to show on the board.
+// Catch an incomplete setup before it goes on the air: a board with no
+// serial or no choices would otherwise just silently never join in.
 function checkInputTables() {
     for (let i = 0; i <= inputNames.length - 1; i++) {
-        if (inputChoices[i].length != inputPictures[i].length) {
-            serial.writeLine("WARNING " + inputNames[i] + ": " +
-                inputChoices[i].length + " values but " +
-                inputPictures[i].length + " pictures")
-        }
-        for (let k = 0; k <= inputPictures[i].length - 1; k++) {
-            if (inputPictures[i][k].length != 25) {
-                serial.writeLine("WARNING " + inputNames[i] + " picture " + k +
-                    ": " + inputPictures[i][k].length + " chars, need 25")
-            }
+        if (i > inputChoices.length - 1 || inputChoices[i].length == 0) {
+            serial.writeLine("WARNING " + inputNames[i] + ": no choices")
         }
         if (serialOf(inputNames[i]) == "0") {
             serial.writeLine("WARNING " + inputNames[i] + ": serial not set")
@@ -1466,7 +1341,7 @@ function checkInputTables() {
 // Configure THIS board straight from the tables, without the radio.
 //
 // A board never receives its own broadcast, so the board doing the pushing
-// would otherwise set everyone up except itself -- it would sit on "?" while
+// would otherwise set everyone up except itself -- it would stay unnamed while
 // the rest of the network came alive. The old design never hit this because
 // the sender was not a neuron.
 function configureSelf() {
@@ -1491,12 +1366,16 @@ function configureSelf() {
             choiceValues = []
             choiceValuesSeen = []
             choicePics = []
+            if (k > inputChoices.length - 1) {
+                continue
+            }
             for (let v = 0; v <= inputChoices[k].length - 1; v++) {
                 choiceValues.push(inputChoices[k][v])
                 choiceValuesSeen.push(true)
             }
-            for (let pi = 0; pi <= inputPictures[k].length - 1; pi++) {
-                choicePics.push(inputPictures[k][pi])
+            let pics = k <= inputPictures.length - 1 ? inputPictures[k] : []
+            for (let pi = 0; pi <= pics.length - 1; pi++) {
+                choicePics.push(pics[pi].length == 25 ? pics[pi] : null)
             }
             if (normOn && k <= normMean.length - 1) {
                 myMean = normMean[k]
@@ -1515,7 +1394,7 @@ function configureSelf() {
             fanInSeen = true
             bias = netBias[k]
             biasSeen = true
-            for (let j = 0; j <= netWeights[k].length - 1 && j <= 3; j++) {
+            for (let j = 0; j <= netWeights[k].length - 1 && j < MAX_FAN; j++) {
                 ownWeights[j] = netWeights[k][j]
                 weightsSeen[j] = true
                 // The wiring, from the same table the radio push reads. Without
@@ -1524,7 +1403,6 @@ function configureSelf() {
                 // the very problem configureSelf() exists to avoid.
                 sources[j] = k <= netSources.length - 1 &&
                     j <= netSources[k].length - 1 ? netSources[k][j] : ""
-                sourcesSeen = sourcesSeen | (1 << j)
             }
         }
 
@@ -1548,7 +1426,21 @@ function configureSelf() {
     serial.writeLine("this board's serial " + mySerial + " is not in the table")
 }
 
+// True while sendAll() is drawing its own "S" / tick, so the serial-number
+// display does not draw over it.
+let pushing = false
+
 function sendAll() {
+    // Nothing to push until the web page has sent a network: the tables start
+    // empty, and a push from them would only un-configure every board.
+    if (boardNames.length == 0 || netWeights.length == 0) {
+        serial.writeLine("nothing to send -- send the network from the web page first")
+        basic.showIcon(IconNames.No)
+        basic.pause(800)
+        showState()
+        return
+    }
+    pushing = true
     basic.showString("S")
     checkInputTables()
     // Set ourselves up first: our own broadcast will not reach us.
@@ -1570,42 +1462,14 @@ function sendAll() {
     basic.showIcon(IconNames.Yes)
     basic.pause(400)
     basic.clearScreen()
-}
-
-// ============================================================
-//  4. Collecting the answer
-// ============================================================
-let yOut: number[] = [0, 0]
-let ySeen: boolean[] = [false, false]
-
-// Folded into neuron.ts's single radio.onReceivedValue -- see collectAnswer().
-// Registering onReceivedValue twice REPLACES the first, so there must only ever
-// be one in the merged file.
-function collectAnswer(name: string, value: number) {
-    // Output neurons report "y0o" / "y1o" when they finish a round.
-    if (name == "y0o") {
-        yOut[0] = value
-        ySeen[0] = true
-    }
-    if (name == "y1o") {
-        yOut[1] = value
-        ySeen[1] = true
-    }
-    if (ySeen[0] && ySeen[1]) {
-        // Both logits in: the bigger one wins. Sigmoid is monotonic, so this
-        // is the same class the training page's softmax would pick.
-        let winner = yOut[0] >= yOut[1] ? 0 : 1
-        serial.writeLine("y0=" + yOut[0] + "  y1=" + yOut[1] + "  -> class " + winner)
-        basic.showNumber(winner)
-        ySeen[0] = false
-        ySeen[1] = false
-    }
+    pushing = false
+    displayDirty = true
 }
 
 // ============================================================
 //  6. UART -> RADIO BRIDGE
 //
-//  The browser (kids.html) opens this board over WebUSB and writes plain text
+//  The web page (website.html) opens this board over WebUSB and writes plain text
 //  lines. Each line is one command; the board answers with a line so the page
 //  can wait for it rather than guessing at timing.
 //
@@ -1623,7 +1487,8 @@ function collectAnswer(name: string, value: number) {
 //    NORM <i> <mean> <std>   -> "OK NORM <i>"    how x board i scales its value
 //    NORM off                -> "OK NORM off"   send raw values instead
 //    CHOICES <i> <v,v,...>   -> "OK CHOICES <i>" an x board's values
-//    PIC <i> <k> <25 bits>   -> "OK PIC <i> <k>" one picture, as 0/1 text
+//    PIC <i> <k> <25 bits|-> -> "OK PIC <i> <k>" one picture, as 0/1 text;
+//                                                "-" = no picture
 //    YPIC <i> <25 bits|->    -> "OK YPIC <i>"    an answer's picture, "-" clears
 //    SEND                    -> "OK SEND"        push everything over radio
 //    CALC                    -> "OK CALC"        run one round
@@ -1813,8 +1678,13 @@ function handleLine(line: string) {
             netBias.push(0)
         }
         ensureRow(netWeights, i)
+        let ws = parseNumbers(f[3])
+        if (ws.length > MAX_FAN) {
+            serial.writeLine("ERR NEURON has " + ws.length + " weights, at most " + MAX_FAN)
+            return
+        }
         netBias[i] = parseFloat(f[2])
-        netWeights[i] = parseNumbers(f[3])
+        netWeights[i] = ws
         serial.writeLine("OK NEURON " + i)
         return
     }
@@ -1946,7 +1816,8 @@ function handleLine(line: string) {
         let bi = parseInt(f[1])
         let k = parseInt(f[2])
         let bits = f[3]
-        if (bits.length != 25) {
+        // "-" is how the page says "this choice has no picture".
+        if (bits != "-" && bits.length != 25) {
             serial.writeLine("ERR PIC needs 25 bits, got " + bits.length)
             return
         }
@@ -1954,9 +1825,9 @@ function handleLine(line: string) {
             inputPictures.push([])
         }
         while (inputPictures[bi].length <= k) {
-            inputPictures[bi].push("0000000000000000000000000")
+            inputPictures[bi].push("")
         }
-        inputPictures[bi][k] = bits
+        inputPictures[bi][k] = bits == "-" ? "" : bits
         serial.writeLine("OK PIC " + bi + " " + k)
         return
     }
@@ -1968,8 +1839,6 @@ function handleLine(line: string) {
     }
 
     if (cmd == "CALC") {
-        ySeen[0] = false
-        ySeen[1] = false
         radio.sendValue("calc", 0)
         serial.writeLine("OK CALC")
         return
@@ -1984,7 +1853,7 @@ serial.onDataReceived(serial.delimiters(Delimiters.NewLine), function () {
 
 
 // ============================================================
-//  Button B: dump this board's state to serial (read-only)
+//  Buttons
 // ============================================================
 input.onButtonEvent(Button.A, input.buttonEventClick(), function () {
     // x board: step back through the choices.
@@ -1998,13 +1867,9 @@ input.onButtonEvent(Button.A, input.buttonEventClick(), function () {
     dumpState(false)
 })
 
-// A+B: start a round for the WHOLE network from any board, exactly as the
-// sender's B button does. The x boards then send their values, those reach the
-// hidden layer over the cables, and the wave runs through to the answers -- so
-// a round can be triggered without the sender being plugged in.
-//
-// This board arms itself too: "calc" is a broadcast, and a board does not hear
-// its own radio messages.
+// A+B on an x board starts a round for the WHOLE network: the x boards send
+// their values, and the wave runs through to the answers. On any other board
+// A+B pushes the network the web page last sent to this board.
 input.onButtonEvent(Button.AB, input.buttonEventClick(), function () {
     // x board: start a round for the whole network. The board arms itself too,
     // because a board never hears its own broadcast.
@@ -2024,27 +1889,23 @@ input.onButtonEvent(Button.AB, input.buttonEventClick(), function () {
 // stays short enough to read at a glance.
 function dumpState(withTable: boolean) {
     serial.writeLine("--- " + (ownName == "" ? "UNCLAIMED" : ownName) + " ---")
-    // Paste this line into the board table on the web page (or allSerials[] in
-    // sender.ts), quotes and all.
-    // The serial is a SIGNED 32-bit int, so it can be negative -- keep the minus.
-    serial.writeLine("    \"" + convertToText(control.deviceSerialNumber()) + "\",")
-    basic.pause(50)
-    serial.writeLine("serial: " + control.deviceSerialNumber())
+    // For the web page's board table. The serial is a SIGNED 32-bit int, so it
+    // can be negative -- the minus belongs to it.
+    serial.writeLine("serial: " + convertToText(control.deviceSerialNumber()))
     serial.writeValue("fanIn", fanIn)
     serial.writeValue("bias", bias)
     serial.writeLine("configured: " + isConfigured())
-    for (let i = 0; i <= 3; i++) {
+    for (let i = 0; i <= fanIn - 1; i++) {
         serial.writeValue("w" + i, ownWeights[i])
         basic.pause(30)
     }
-    for (let i = 0; i <= 3; i++) {
+    for (let i = 0; i <= fanIn - 1; i++) {
         // The source is printed beside the value: with no cables to trace, this
         // line is the only way to see which neuron a slot is listening to, and
         // a slot showing "(no source)" within fanIn is why a board never fires.
         serial.writeLine("in" + i + ": " + inputs[i] +
             "  received: " + received[i] +
-            "  from: " + (sources[i] == "" ? "(no source)" : sources[i]) +
-            (i < fanIn ? "" : "   [unused]"))
+            "  from: " + (sources[i] == "" ? "(no source)" : sources[i]))
         basic.pause(30)
     }
     // The whole board table as this board currently holds it. On B only: it is
@@ -2086,15 +1947,12 @@ input.onButtonEvent(Button.B, input.buttonEventClick(), function () {
 // ============================================================
 // Print this board's serial number the moment it starts, so it can be read off
 // without pressing anything -- plug in USB, open the log, and it is there ready
-// to paste into the web page's board table. Quoted and comma'd for exactly that.
-// Repeated a few times over the first seconds, not printed once: a serial
-// monitor is usually opened AFTER the board has already booted, and a single
-// line at power-on would be gone before anyone could see it.
+// for the web page's board table. Repeated a few times over the first seconds:
+// a serial monitor is usually opened AFTER the board has already booted.
 control.inBackground(function () {
     for (let boot = 0; boot <= 5; boot++) {
         serial.writeLine("=== " + (ownName == "" ? "unclaimed board" : ownName) +
-            " === serial: " + control.deviceSerialNumber())
-        serial.writeLine("    \"" + convertToText(control.deviceSerialNumber()) + "\",")
+            " === serial: " + convertToText(control.deviceSerialNumber()))
         basic.pause(1500)
     }
 })
@@ -2103,5 +1961,29 @@ control.inBackground(function () {
 // not mean re-running the whole setup.
 loadFromFlash()
 
-// Show what we are: the restored name, or "?" if nothing was saved.
+// Show what we are: the restored name, or (below) the serial number if
+// nothing was saved.
 showState()
+
+// A board without a name scrolls its serial number across the display, over
+// and over -- so it can be read straight off the board into the web page's
+// board table. Scrolled as one string, so repeated digits ("22") read as
+// two characters passing by rather than one character that lingers.
+//
+// A scroll cannot be interrupted: a name arriving mid-scroll is drawn by the
+// main loop, overwritten by the rest of the scroll, and repainted once the
+// scroll ends (displayDirty below) -- so it can take one scroll to appear.
+control.inBackground(function () {
+    let sn = convertToText(control.deviceSerialNumber())
+    while (true) {
+        if (ownName != "" || pushing) {
+            basic.pause(200)
+            continue
+        }
+        basic.showString(sn)
+        if (ownName != "") {
+            displayDirty = true
+        }
+        basic.pause(600)                   // short gap before it repeats
+    }
+})

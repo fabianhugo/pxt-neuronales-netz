@@ -21,7 +21,5 @@
     "preferredEditor": "tsprj",
     "testDependencies": {
         "v3": "*"
- 
     }
-
 }
