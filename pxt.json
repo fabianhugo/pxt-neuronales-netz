@@ -1,0 +1,27 @@
+{
+    "name": "neural-network",
+    "version": "0.0.1",
+    "description": "A neural network spread across several Calliope mini / micro:bit boards. Each board is one neuron; values travel between neurons over RADIO instead of cables.",
+    "license": "MIT",
+    "dependencies": {
+        "core": "*",
+        "funk": "*",
+        "settings": "*"
+    },
+    "files": [
+        "README.md",
+        "neuron.ts"
+    ],
+    "testFiles": [
+        "test.ts"
+    ],
+    "supportedTargets": [
+        "calliopemini"
+    ],
+    "preferredEditor": "tsprj",
+    "testDependencies": {
+        "v3": "*"
+ 
+    }
+
+}
