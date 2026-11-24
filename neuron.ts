@@ -1158,16 +1158,58 @@ let inputPictures: string[][] = []
 // Tell a board who it is. Repeated because radio is unacknowledged and this is
 // the one message a board cannot do without: miss it and the board ignores
 // everything else that follows, and keeps showing its serial number.
+// ---- Progress of a push, for the web page's progress bar ----
+//
+// Nearly all of sendAll()'s time is the pause after each radio message, so
+// progress is measured in those milliseconds, not in messages. sendAll() runs
+// the whole push twice: first as a DRY RUN that sends nothing, logs nothing and
+// only adds up the pauses, then for real, reporting "PROG <percent>" as it goes.
+// Counting with the very code that sends means the total can never drift away
+// from what is actually sent.
+let pushDry = false
+let pushTotalMs = 0
+let pushDoneMs = 0
+let pushLastPct = -1
+
+function airValue(name: string, value: number, pauseMs: number) {
+    if (!pushDry) radio.sendValue(name, value)
+    airPause(pauseMs)
+}
+function airString(msg: string, pauseMs: number) {
+    if (!pushDry) radio.sendString(msg)
+    airPause(pauseMs)
+}
+function airPause(ms: number) {
+    if (pushDry) {
+        pushTotalMs += ms
+        return
+    }
+    basic.pause(ms)
+    pushDoneMs += ms
+    pushProgress()
+}
+// One line per whole percent at most, so the USB log is not flooded.
+function pushProgress() {
+    let pct = pushTotalMs > 0 ? Math.idiv(pushDoneMs * 100, pushTotalMs) : 100
+    if (pct > 100) pct = 100
+    if (pct != pushLastPct) {
+        pushLastPct = pct
+        serial.writeLine("PROG " + pct)
+    }
+}
+function pushLog(line: string) {
+    if (!pushDry) serial.writeLine(line)
+}
+
 function sendIdentity(name: string) {
     let sn = serialOf(name)
     let msg = sn + "=" + name
     // Print exactly what goes on the air, so it can be compared with the
     // "id? want [...] mine [...]" line each board logs.
-    serial.writeLine("id-> [" + msg + "] (from " + sn + ")" +
+    pushLog("id-> [" + msg + "] (from " + sn + ")" +
         (sn == "0" ? "   <-- NO SERIAL SET for " + name : ""))
     for (let attempt = 0; attempt <= 2; attempt++) {
-        radio.sendString(msg)
-        basic.pause(120)
+        airString(msg, 120)
     }
 }
 
@@ -1181,13 +1223,10 @@ function sendNeuron(index: number) {
     // whole round. Sent three times; a repeat is harmless because a board that
     // already has the name simply re-adopts it.
     sendIdentity(name)
-    radio.sendValue(name + "i", weights.length)   // fanIn
-    basic.pause(60)
-    radio.sendValue(name + "b", netBias[index])   // bias
-    basic.pause(60)
+    airValue(name + "i", weights.length, 60)   // fanIn
+    airValue(name + "b", netBias[index], 60)   // bias
     for (let j = 0; j <= weights.length - 1; j++) {
-        radio.sendValue(name + "w" + j, weights[j])
-        basic.pause(60)
+        airValue(name + "w" + j, weights[j], 60)
     }
     // The wiring: one message per input slot, naming the neuron that feeds it.
     // Without these the board knows its weights but not what to multiply them
@@ -1197,13 +1236,12 @@ function sendNeuron(index: number) {
     for (let j = 0; j <= weights.length - 1; j++) {
         let src = j <= srcs.length - 1 ? srcs[j] : ""
         if (src == "") {
-            serial.writeLine("WARNING " + name + ": no source for input " + j)
+            pushLog("WARNING " + name + ": no source for input " + j)
             continue
         }
-        radio.sendString(name + "s" + j + ":" + src)
-        basic.pause(60)
+        airString(name + "s" + j + ":" + src, 60)
     }
-    serial.writeLine("sent " + name + " (" + weights.length + " weights)")
+    pushLog("sent " + name + " (" + weights.length + " weights)")
 }
 
 // Pack a 25-character "0"/"1" picture into 5 characters, one per row: each row
@@ -1239,14 +1277,10 @@ function sendOutput(index: number) {
     let msg = outputMessages[index]
     let col = outputColors[index]
 
-    radio.sendValue(name + "t", pushThreshold)
-    basic.pause(120)
-    radio.sendValue(name + "cr", col[0])
-    basic.pause(120)
-    radio.sendValue(name + "cg", col[1])
-    basic.pause(120)
-    radio.sendValue(name + "cb", col[2])
-    basic.pause(120)
+    airValue(name + "t", pushThreshold, 120)
+    airValue(name + "cr", col[0], 120)
+    airValue(name + "cg", col[1], 120)
+    airValue(name + "cb", col[2], 120)
 
     // "<name>m<n>:" is 5 characters while the chunk index is one digit, leaving
     // 14 of the 19-character radio limit. At chunk 10 the header grows to 6, so
@@ -1256,8 +1290,7 @@ function sendOutput(index: number) {
     let pos = 0
     while (pos < msg.length) {
         let take = chunk < 10 ? 14 : 13
-        radio.sendString(name + "m" + chunk + ":" + msg.substr(pos, take))
-        basic.pause(150)
+        airString(name + "m" + chunk + ":" + msg.substr(pos, take), 150)
         pos = pos + take
         chunk = chunk + 1
     }
@@ -1266,11 +1299,10 @@ function sendOutput(index: number) {
     // inside the 19-character radio limit.
     let pic = index <= outputPictures.length - 1 ? outputPictures[index] : ""
     if (pic != "" && pic.length == 25) {
-        radio.sendString(name + "q0:" + packPicture(pic))
-        basic.pause(150)
-        serial.writeLine("sent " + name + " picture")
+        airString(name + "q0:" + packPicture(pic), 150)
+        pushLog("sent " + name + " picture")
     }
-    serial.writeLine("sent " + name + " message: " + msg)
+    pushLog("sent " + name + " message: " + msg)
 }
 
 // Give an x board its identity, its list of values and one picture per value.
@@ -1280,19 +1312,15 @@ function sendInput(index: number) {
     let pics = index <= inputPictures.length - 1 ? inputPictures[index] : []
 
     sendIdentity(name)
-    radio.sendValue(name + "n", values.length)        // how many choices
-    basic.pause(200)
+    airValue(name + "n", values.length, 200)        // how many choices
 
     // How this board scales its value before sending it on. "s" of 0 means
     // "no scaling"; anything else is the divisor, with "m" the mean.
     if (normOn && index <= normMean.length - 1) {
-        radio.sendValue(name + "m", normMean[index])
-        basic.pause(150)
-        radio.sendValue(name + "s", normStd[index])
-        basic.pause(150)
+        airValue(name + "m", normMean[index], 150)
+        airValue(name + "s", normStd[index], 150)
     } else {
-        radio.sendValue(name + "s", 0)
-        basic.pause(150)
+        airValue(name + "s", 0, 150)
     }
 
     // VALUES FIRST, all of them, before any picture. The values are what the
@@ -1300,15 +1328,13 @@ function sendInput(index: number) {
     // Interleaving them meant a picture was in flight while the next value was
     // sent, and the value lost the race.
     for (let k = 0; k <= values.length - 1; k++) {
-        radio.sendValue(name + "v" + k, values[k])
-        basic.pause(200)
+        airValue(name + "v" + k, values[k], 200)
     }
     // Send them once more: radio is unacknowledged, and a dropped value leaves
     // a hole the board cannot fill on its own. A repeat just overwrites its
     // own slot, so it is harmless.
     for (let k = 0; k <= values.length - 1; k++) {
-        radio.sendValue(name + "v" + k, values[k])
-        basic.pause(200)
+        airValue(name + "v" + k, values[k], 200)
     }
     // Pictures last, once the board is already usable. One message each: the
     // 25 bits are PACKED, five per character, so the whole picture fits in the
@@ -1319,10 +1345,9 @@ function sendInput(index: number) {
         if (pics[k].length != 25) {
             continue
         }
-        radio.sendString(name + "p" + k + ":" + packPicture(pics[k]))
-        basic.pause(150)
+        airString(name + "p" + k + ":" + packPicture(pics[k]), 150)
     }
-    serial.writeLine("sent " + name + " (" + values.length + " choices)")
+    pushLog("sent " + name + " (" + values.length + " choices)")
 }
 
 // Catch an incomplete setup before it goes on the air: a board with no
@@ -1446,10 +1471,28 @@ function sendAll() {
     // Set ourselves up first: our own broadcast will not reach us.
     configureSelf()
     saveToFlash()
+    // Dry run first to learn the total time, then the real push (see airPause).
+    pushDry = true
+    pushTotalMs = 0
+    pushEverything()
+    pushDry = false
+    pushDoneMs = 0
+    pushLastPct = -1
+    pushProgress()
+    pushEverything()
+    basic.showIcon(IconNames.Yes)
+    basic.pause(400)
+    basic.clearScreen()
+    pushing = false
+    displayDirty = true
+}
+
+// Everything sendAll() puts on the air. Runs twice: once as a dry run that only
+// adds up the time, once for real.
+function pushEverything() {
     // Which activation everyone uses. Sent first: it changes what every hidden
     // neuron computes, so it should be in place before any weights arrive.
-    radio.sendValue("act", pushAct)
-    basic.pause(120)
+    airValue("act", pushAct, 120)
     for (let i = 0; i <= boardNames.length - 1; i++) {
         sendNeuron(i)
     }
@@ -1459,11 +1502,6 @@ function sendAll() {
     for (let i = 0; i <= outputNames.length - 1; i++) {
         sendOutput(i)
     }
-    basic.showIcon(IconNames.Yes)
-    basic.pause(400)
-    basic.clearScreen()
-    pushing = false
-    displayDirty = true
 }
 
 // ============================================================
@@ -1490,7 +1528,9 @@ function sendAll() {
 //    PIC <i> <k> <25 bits|-> -> "OK PIC <i> <k>" one picture, as 0/1 text;
 //                                                "-" = no picture
 //    YPIC <i> <25 bits|->    -> "OK YPIC <i>"    an answer's picture, "-" clears
-//    SEND                    -> "OK SEND"        push everything over radio
+//    SEND                    -> "OK SEND"        push everything over radio;
+//                                                while it runs, "PROG <0-100>"
+//                                                lines report how far it is
 //    CALC                    -> "OK CALC"        run one round
 //
 //  Names are assigned positionally: neuron i takes boardNames[i], so the
