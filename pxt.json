@@ -15,11 +15,11 @@
     "testFiles": [
         "test.ts"
     ],
+    "testDependencies": {
+        "v3": "*"
+    },
     "supportedTargets": [
         "calliopemini"
     ],
-    "preferredEditor": "tsprj",
-    "testDependencies": {
-        "v3": "*"
-    }
+    "preferredEditor": "tsprj"
 }
